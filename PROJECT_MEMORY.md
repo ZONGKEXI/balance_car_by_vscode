@@ -1,0 +1,933 @@
+# PROJECT_MEMORY.md
+
+> 用途：把当前聊天中关于 STM32F103 两轮自平衡小车项目的上下文迁移到新的项目/聊天中继续使用。  
+> 当前开发策略：暂时不使用 FreeRTOS，采用 **STM32CubeMX + HAL + CMake + 裸机 while(1) + HAL_GetTick() 非阻塞调度**。
+
+---
+
+## 1. 项目目标
+
+当前项目是 **STM32F103 两轮自平衡小车**。
+
+主要目标：
+- 使用 STM32F103 完成底层外设驱动与控制逻辑。
+- 使用 TB6612FNG 驱动左右直流电机。
+- 后续接入左右编码器、IMU、PID，实现平衡、速度、转向控制。
+- 实现电池电压 ADC 采集与电量 LED 指示。
+- 使用 USART2 做串口调试。
+- 使用 PA11 用户按键控制 TB6612 的 STBY 总使能。
+- 后续熟悉后再考虑迁移到 FreeRTOS。
+
+当前推荐开发思路：
+
+```text
+CubeMX 配置底层外设
+        ↓
+HAL 生成 MX_xxx_Init()
+        ↓
+自定义 app_xxx.c/.h 做应用层封装
+        ↓
+main.c 中初始化
+        ↓
+while(1) 中运行非阻塞任务
+```
+
+---
+
+## 2. 开发环境
+
+- IDE/编辑器：VSCode
+- 配置工具：STM32CubeMX
+- 固件库：HAL
+- 构建方式：CMake
+- MCU：STM32F103xB 系列
+- 工程中可见启动文件：`startup_stm32f103xb.s`
+
+推荐自定义文件结构：
+
+```text
+Core/
+├─ Inc/
+│  ├─ app_bat.h
+│  ├─ app_usart.h
+│  ├─ app_button.h
+│  ├─ app_pwm.h
+│  └─ button.h
+│
+└─ Src/
+   ├─ app_bat.c
+   ├─ app_usart.c
+   ├─ app_button.c
+   ├─ app_pwm.c
+   └─ button.c
+```
+
+注意：
+- 自定义应用代码不要放进 `Drivers`。
+- CMake 工程新增 `.c` 后，若出现链接错误，需要检查根目录 `CMakeLists.txt` 是否已把新文件加入 `target_sources(...)`。
+- 曾经出现过 `App_Bat_Init` 相关链接错误，主要怀疑是 `app_bat.c` 未加入 CMake 源文件列表。
+
+---
+
+## 3. 当前硬件与引脚映射
+
+已明确：
+
+```text
+PA11 → USER_KEY
+PA1  → TB6612_STBY
+
+PA4  → LED1
+PA5  → LED2
+PA6  → LED3
+
+PB0  → ADC1_IN8 / VBAT_SENSE
+
+PA2  → USART2_TX
+PA3  → USART2_RX
+```
+
+从用户提供的整板引脚图还可见：
+
+```text
+PA8  → MOTOR_L_PWM / TIM1_CH1
+PB6  → MOTOR_R_PWM / TIM4_CH1
+
+MOTOR_L_IN1
+MOTOR_L_IN2
+
+MOTOR_R_IN1
+MOTOR_R_IN2
+
+MOTOR_L_ENCA / ENCB
+MOTOR_R_ENCA / ENCB
+
+I2C_SCL / I2C_SDA
+```
+
+后续关于 PWM、方向、编码器、IMU 的配置，以用户提供的原理图/引脚图为准。
+
+---
+
+## 4. TB6612FNG 电机驱动
+
+驱动芯片：**TB6612FNG**
+
+关键控制信号：
+- STBY
+- AIN1 / AIN2 / PWMA
+- BIN1 / BIN2 / PWMB
+
+当前理解：
+
+```text
+STBY = 0
+→ TB6612 待机
+→ 电机驱动关闭
+
+STBY = 1
+→ TB6612 工作
+→ 电机驱动允许输出
+```
+
+因此 STBY 可以理解为电机驱动系统的“总闸”。
+
+当前 STM32 映射：
+
+```text
+PA1 → TB6612_STBY
+```
+
+当前阶段先只实现：
+
+```text
+第一次按 PA11
+→ STBY = 1
+→ TB6612 使能
+
+第二次按 PA11
+→ STBY = 0
+→ TB6612 待机
+```
+
+暂时不急着加入真正的左右 PWM、方向控制和电机转动。
+
+---
+
+## 5. PA11 USER_KEY 的 CubeMX 配置
+
+PA11 用于读取按钮状态，所以配置为输入：
+
+```text
+PA11
+→ GPIO_Input
+```
+
+推荐：
+
+```text
+GPIO mode              Input mode
+GPIO Pull-up/Pull-down Pull-up
+User Label             USER_KEY
+```
+
+逻辑：
+
+```text
+未按下 → PA11 = 1
+按下   → PA11 = 0
+```
+
+HAL 读取：
+
+```c
+HAL_GPIO_ReadPin(USER_KEY_GPIO_Port, USER_KEY_Pin)
+```
+
+按下判断：
+
+```c
+if (HAL_GPIO_ReadPin(USER_KEY_GPIO_Port, USER_KEY_Pin) == GPIO_PIN_RESET)
+{
+    // 按下
+}
+```
+
+原因：
+
+```text
+USER_KEY → STM32
+所以 PA11 是输入
+```
+
+---
+
+## 6. PA1 TB6612_STBY 的 CubeMX 配置
+
+PA1 用于 STM32 主动控制 TB6612，所以配置为输出：
+
+```text
+PA1
+→ GPIO_Output
+```
+
+推荐：
+
+```text
+GPIO output level      Low
+GPIO mode              Output Push Pull
+GPIO Pull-up/Pull-down No pull
+Maximum output speed   Low
+User Label             TB6612_STBY
+```
+
+推荐初始电平为 Low：
+
+```text
+PA1 = 0
+→ STBY = 0
+→ TB6612 上电默认待机
+```
+
+CubeMX 重新生成代码后，`main.h` 应有：
+
+```c
+#define USER_KEY_Pin GPIO_PIN_11
+#define USER_KEY_GPIO_Port GPIOA
+
+#define TB6612_STBY_Pin GPIO_PIN_1
+#define TB6612_STBY_GPIO_Port GPIOA
+```
+
+注意：
+`TB6612_STBY_GPIO_Port` 和 `TB6612_STBY_Pin` 不是在 `app_pwm.c` 里手动定义的，而是 CubeMX 根据 `User Label = TB6612_STBY` 自动生成的宏。
+
+---
+
+## 7. 教程中的 button / app_button 设计意图
+
+教程将“底层按键检测”和“应用逻辑”分开：
+
+```text
+button.c / button.h
+        ↓
+通用按键驱动
+负责：
+- 读取 GPIO
+- 消抖
+- 判断按下/松开
+- 统计点击次数
+- 触发回调
+
+        ↓
+
+app_button.c / app_button.h
+        ↓
+应用层
+负责：
+- 指定 PA11 是 USER_KEY
+- 单击后做什么
+- 双击后做什么
+```
+
+教程示例：
+
+```c
+static Button_TypeDef userKey;
+static void OnUserKey_Clicked(uint8_t clicks);
+```
+
+`clicks` 是回调函数的参数。
+
+底层按键驱动检测到一次点击后，本质上类似：
+
+```c
+OnUserKey_Clicked(1);
+```
+
+因此：
+
+```c
+if (clicks == 1)
+{
+    ...
+}
+```
+
+表示单击事件。
+
+---
+
+## 8. 教程中的 pwm_on 状态翻转逻辑
+
+教程中：
+
+```c
+static uint8_t pwm_on = 0;
+```
+
+含义：
+
+```text
+0 → 电机驱动待机
+1 → 电机驱动活动
+```
+
+单击后：
+
+```c
+if (pwm_on == 0)
+{
+    pwm_on = 1;
+}
+else
+{
+    pwm_on = 0;
+}
+
+App_PWM_Cmd(pwm_on);
+```
+
+可以简化为：
+
+```c
+pwm_on = !pwm_on;
+App_PWM_Cmd(pwm_on);
+```
+
+执行效果：
+
+```text
+第一次按：
+0 → 1 → App_PWM_Cmd(1) → STBY = 1
+
+第二次按：
+1 → 0 → App_PWM_Cmd(0) → STBY = 0
+```
+
+---
+
+## 9. app_pwm 当前设计
+
+当前阶段 `app_pwm` 暂时只负责 STBY，不急着加入真正 PWM。
+
+推荐接口：
+
+```c
+void App_PWM_Init(void);
+void App_PWM_Cmd(uint8_t on);
+```
+
+### app_pwm.h
+
+```c
+#ifndef __APP_PWM_H
+#define __APP_PWM_H
+
+#include "main.h"
+
+void App_PWM_Init(void);
+void App_PWM_Cmd(uint8_t on);
+
+#endif
+```
+
+### app_pwm.c
+
+```c
+#include "app_pwm.h"
+
+void App_PWM_Init(void)
+{
+    HAL_GPIO_WritePin(
+        TB6612_STBY_GPIO_Port,
+        TB6612_STBY_Pin,
+        GPIO_PIN_RESET
+    );
+}
+
+void App_PWM_Cmd(uint8_t on)
+{
+    if (on == 0)
+    {
+        HAL_GPIO_WritePin(
+            TB6612_STBY_GPIO_Port,
+            TB6612_STBY_Pin,
+            GPIO_PIN_RESET
+        );
+    }
+    else
+    {
+        HAL_GPIO_WritePin(
+            TB6612_STBY_GPIO_Port,
+            TB6612_STBY_Pin,
+            GPIO_PIN_SET
+        );
+    }
+}
+```
+
+对应教程 SPL：
+
+```c
+GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_RESET);
+GPIO_WriteBit(GPIOA, GPIO_Pin_1, Bit_SET);
+```
+
+HAL 对应：
+
+```c
+HAL_GPIO_WritePin(..., GPIO_PIN_RESET);
+HAL_GPIO_WritePin(..., GPIO_PIN_SET);
+```
+
+---
+
+## 10. app_button 当前准备实现的功能
+
+目标：
+
+```text
+PA11 单击
+↓
+状态翻转
+↓
+App_PWM_Cmd()
+↓
+PA1 改变
+↓
+TB6612 开 / 关
+```
+
+暂定状态：
+
+```c
+static uint8_t pwm_on = 0;
+```
+
+单击回调：
+
+```c
+static void OnUserKey_Clicked(uint8_t clicks)
+{
+    if (clicks == 1)
+    {
+        pwm_on = !pwm_on;
+        App_PWM_Cmd(pwm_on);
+    }
+}
+```
+
+当前还没有最终定稿完整 `app_button.c/.h`，因为当前阶段是在逐步理解教程逻辑后再实现。
+
+---
+
+## 11. 电池 ADC 模块
+
+### 原教程链路
+
+```text
+TIM2
+→ 每 10 ms Update
+→ TIM2_TRGO
+→ ADC1 Injected Conversion
+→ PB0 / ADC1_IN8
+→ JDR1
+→ JEOC
+→ ADC1_2_IRQHandler
+```
+
+### 时钟
+
+```text
+HSE = 8 MHz
+PLL ×9
+SYSCLK = 72 MHz
+HCLK = 72 MHz
+
+APB1 = /2
+PCLK1 = 36 MHz
+APB1 Timer Clock = 72 MHz
+
+APB2 = /1
+PCLK2 = 72 MHz
+ADC Prescaler = /6
+ADC Clock = 12 MHz
+```
+
+### TIM2
+
+```text
+Prescaler = 71
+ARR = 9999
+Counter Mode = Up
+TRGO = Update Event
+```
+
+计算：
+
+```text
+72 MHz / (71 + 1) = 1 MHz
+→ 1 us / count
+
+10000 counts = 10 ms
+→ 100 Hz
+```
+
+### ADC1 Injected
+
+```text
+PB0 → ADC1_IN8
+
+Injected conversions = 1
+External Trigger = TIM2 TRGO
+Rank 1 = ADC1_IN8
+Sampling Time = 1.5 cycles（匹配教程）
+```
+
+### HAL 启动
+
+```c
+HAL_ADCEx_Calibration_Start(&hadc1);
+HAL_ADCEx_InjectedStart_IT(&hadc1);
+HAL_TIM_Base_Start(&htim2);
+```
+
+### 中断链路
+
+```text
+TIM2 Update
+→ TIM2_TRGO
+→ ADC1 injected conversion
+→ JDR1
+→ JEOC
+→ ADC1_2_IRQn
+→ ADC1_2_IRQHandler()
+→ HAL_ADC_IRQHandler(&hadc1)
+→ HAL_ADCEx_InjectedConvCpltCallback()
+```
+
+回调中：
+
+```c
+if (hadc->Instance == ADC1)
+{
+    ...
+}
+```
+
+表示确认是 ADC1 触发的回调。
+
+---
+
+## 12. 电池 LED 逻辑
+
+PA4、PA5、PA6：
+
+```text
+PA4 → LED1
+PA5 → LED2
+PA6 → LED3
+```
+
+当前电压分级：
+
+```text
+vbat > 7.9 V
+→ 三灯亮
+
+7.4 < vbat <= 7.9
+→ 两灯亮
+
+7.0 < vbat <= 7.4
+→ 一灯亮
+
+6.5 < vbat <= 7.0
+→ 全灭
+
+vbat <= 6.5
+→ 三灯闪烁
+```
+
+闪烁采用 `HAL_GetTick()`，非阻塞：
+
+```c
+uint32_t now = HAL_GetTick();
+
+if (now - lastTime >= 100)
+{
+    ...
+    lastTime = now;
+}
+```
+
+不使用：
+
+```c
+HAL_Delay(100);
+```
+
+---
+
+## 13. 电池 app_bat 现有设计
+
+核心变量：
+
+```c
+volatile uint16_t g_bat_adc_raw;
+volatile float g_bat_adc_voltage;
+volatile float g_bat_voltage;
+volatile uint8_t g_bat_data_valid;
+```
+
+初始化：
+
+```c
+void App_Bat_Init(void)
+{
+    HAL_ADCEx_Calibration_Start(&hadc1);
+    HAL_ADCEx_InjectedStart_IT(&hadc1);
+    HAL_TIM_Base_Start(&htim2);
+}
+```
+
+回调：
+
+```c
+void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1)
+    {
+        g_bat_adc_raw =
+            HAL_ADCEx_InjectedGetValue(
+                hadc,
+                ADC_INJECTED_RANK_1
+            );
+
+        ...
+    }
+}
+```
+
+`BAT_DIVIDER_RATIO` 当前仍需根据实际硬件分压或已经验证的标定值确定。
+
+此前串口曾观察到约：
+
+```text
+7.39 V
+```
+
+因此如果当前标定已能正确显示实际电池电压，不要随意改回 `1.0f`。
+
+---
+
+## 14. ST-Link 与电池供电现象
+
+已观察：
+
+```text
+ST-Link连接 + 小车电源OFF
+→ 仍有串口 / 可读电池电压
+
+ST-Link断开 + 电源OFF
+→ 无串口
+
+ST-Link断开 + 电源ON
+→ 有串口
+```
+
+当前判断：
+- ST-Link 可以给 MCU 供电。
+- 小车电池通过主开关给 MCU 供电。
+- 电池 ADC 分压采样点可能位于主开关之前。
+- 因此主开关 OFF 时，只要 MCU 仍由 ST-Link 供电，ADC 仍可能读到电池电压。
+
+---
+
+## 15. USART2
+
+```text
+PA2 → USART2_TX
+PA3 → USART2_RX
+```
+
+CubeMX：
+
+```text
+Mode              Asynchronous
+Baud Rate         921600
+Word Length       8 Bits
+Parity            None
+Stop Bits         1
+Direction         TX/RX
+Hardware Flow     None
+Oversampling      16
+```
+
+USART2 时钟：
+
+```text
+PCLK1 = 36 MHz
+```
+
+注意：USART2 不像 APB1 Timer 那样获得 ×2 时钟。
+
+HAL 输出：
+
+```c
+HAL_UART_Transmit(...)
+```
+
+或封装：
+
+```c
+My_USART_Printf(&huart2, "BAT = %.3f V\r\n", volt);
+```
+
+ARM GCC/newlib-nano 下 `%f` 可能需要额外开启 float printf 支持。
+
+---
+
+## 16. FreeRTOS 决策
+
+此前尝试过 FreeRTOS，但当前明确决定：
+
+> 暂时不用 FreeRTOS，后续学会后再迁移。
+
+因此当前采用：
+
+```text
+裸机
++
+HAL_GetTick()
++
+while(1)
++
+非阻塞任务
+```
+
+CubeMX：
+
+```text
+FREERTOS = Disable
+```
+
+SYS：
+
+```text
+Timebase Source = SysTick
+```
+
+如果此前为了 FreeRTOS 改为 TIM4，应恢复为 SysTick。
+
+当前主循环思路：
+
+```c
+while (1)
+{
+    App_Bat_LED_Process();
+    App_Button_Proc();
+
+    // 后续加入其他低速任务
+}
+```
+
+真正的平衡控制后续更适合放在固定周期定时器/中断里。
+
+---
+
+## 17. 当前定时器资源思路
+
+当前：
+
+```text
+TIM2 → 电池 ADC 触发
+```
+
+后续可能：
+
+```text
+TIM1 → 电机 PWM
+TIM3 / TIM4 → 编码器
+```
+
+具体仍需结合最终硬件引脚映射确认。
+
+---
+
+## 18. 软件设计原则
+
+CubeMX/HAL 负责：
+- RCC
+- GPIO
+- ADC
+- TIM
+- USART
+- NVIC
+
+应用层 `app_xxx` 负责：
+- 业务逻辑
+- 状态管理
+- 模块封装
+- 对外接口
+
+典型流程：
+
+```text
+CubeMX 配置
+↓
+MX_GPIO_Init()
+MX_ADC1_Init()
+MX_TIM2_Init()
+...
+↓
+App_xxx_Init()
+↓
+while(1)
+↓
+App_xxx_Process()
+```
+
+---
+
+## 19. 当前最新状态
+
+目前已完成/确认：
+
+1. PA11 已在 CubeMX 配置为 `USER_KEY`、`GPIO_Input`、`Pull-up`。
+2. PA1 已在 CubeMX 配置为 `TB6612_STBY`、`GPIO_Output`。
+3. PA1 推荐上电默认 Low。
+4. 已理解：
+   - PA11 为什么是输入。
+   - PA1 为什么是输出。
+   - `clicks == 1` 表示单击。
+   - `clicks` 来自底层按键驱动调用回调时传参。
+   - `pwm_on` 用于保存 TB6612 当前使能状态。
+   - `App_PWM_Cmd()` 最终控制 STBY。
+5. 当前准备开始正式实现 `button.c/.h`、`app_button.c/.h`、`app_pwm.c/.h`。
+6. `app_pwm` 当前先只控制 STBY，不急着加入真正 PWM。
+7. 当前项目保持裸机，不使用 FreeRTOS。
+
+---
+
+## 20. 下一步建议
+
+推荐继续顺序：
+
+```text
+① 检查 main.h：
+   USER_KEY_Pin
+   USER_KEY_GPIO_Port
+   TB6612_STBY_Pin
+   TB6612_STBY_GPIO_Port
+
+② 完成最小 app_pwm.c/.h
+   只控制 STBY
+
+③ 完成 button.c/.h
+   GPIO读取
+   软件消抖
+   单击识别
+   回调
+
+④ 完成 app_button.c/.h
+   单击：
+   pwm_on = !pwm_on
+   App_PWM_Cmd(pwm_on)
+
+⑤ main.c：
+   App_PWM_Init()
+   App_Button_Init()
+
+   while(1)
+   {
+       App_Button_Proc();
+   }
+
+⑥ 用万用表测 PA1：
+   上电 0V
+   按一下约 3.3V
+   再按一下 0V
+
+⑦ 确认 STBY 正常后，再加入状态 LED。
+
+⑧ 最后再继续：
+   IN1 / IN2
+   PWM
+   编码器
+   IMU
+   PID
+```
+
+---
+
+## 21. 当前最核心逻辑
+
+```text
+PA11 按键
+↓
+button 检测单击
+↓
+app_button 翻转 pwm_on
+↓
+App_PWM_Cmd()
+↓
+PA1 / TB6612_STBY
+↓
+电机驱动使能 / 待机
+```
+
+当前原则：先把最小链路跑通，再逐层扩展，不同时堆入 FreeRTOS、PWM、方向、编码器、IMU 和 PID。
+
+---
+
+## 22. 学习协作约定（用户于 2026-09-28 补充）
+
+- 以引导用户亲手完成项目为目标，不直接提供完整代码或代写功能。
+- 用户会在后续对话中说明各阶段学习目标；以用户最新说明为准，不自行推进尚未提出的阶段。
+- 围绕当前目标分步骤解释原理、提出思考问题、提供必要提示；需要时给出少量局部示例，由用户完成实现。
+- 用户提交代码或实验结果后，帮助检查、解释问题并引导修改与验证。
+- 以下两点暂时搁置，等待用户后续阐述，不作为当前学习的阻塞项，也不自行修改相关配置：
+  1. TIM4 在右电机 PWM 与编码器规划中的资源分配。
+  2. 电池分压系数、ST-Link 供电路径及电池采样点位置。
+- 本文中的下一步建议是背景参考，不代表用户已要求立即实施。
